@@ -16,35 +16,55 @@ from utils.early_stopping import EarlyStopping
 logger = logging.getLogger(__name__)
 
 
-def dataset_prep(db, reactions, topologies):
+def dataset_prep(db, reactions, topologies,batch_size=128):
     logger.debug(f'Reactions: {reactions}.')
     logger.debug(f'Topologies: {topologies}.')
     fps, tops, labels = load_data(db, reactions, topologies=topologies, cage_property=False)
     fps, labels = data_process(fps, labels)
     dataset = utils.TensorDataset(fps, labels)
-    #torch.manual_seed(4)
-    big_len = int(len(dataset) * 0.8)
+    #torch.manual_seed(43) acc 089
+    #torch.manual_seed(43)  
+    big_len = int(len(dataset) * 0.85)
     test_len = len(dataset) - big_len
-    val_len = int(big_len * 0.25)
+    val_len = int(big_len * 0.176)
     train_val_len = big_len - val_len
     big_train_dataset, test_dataset = utils.random_split(dataset, (big_len, test_len))
     train_dataset, val_dataset = utils.random_split(big_train_dataset, (train_val_len, val_len))
-    big_train_data = utils.DataLoader(big_train_dataset,batch_size=64,shuffle=True,drop_last=False)
-    train_data = utils.DataLoader(train_dataset, batch_size=64, shuffle=True, drop_last=False)
-    val_data = utils.DataLoader(val_dataset, batch_size=64, shuffle=True, drop_last=False)
+    big_train_data = utils.DataLoader(big_train_dataset,batch_size=batch_size,shuffle=True,drop_last=False)
+    train_data = utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_data = utils.DataLoader(val_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
     test_data = utils.DataLoader(test_dataset, batch_size=64, shuffle=True, drop_last=False)
     #torch.manual_seed(torch.initial_seed())
+    #print(len(big_train_data)*64, len(train_data)*64, len(val_data)*64,len(test_data)*64)
     return big_train_data, train_data, val_data, test_data
 
+
+def train_data_process(data):
+    cnt, y1, y0 = 0, 0, 0
+    for step, batch in enumerate(data):
+        _, y_true = batch[0], batch[1]
+        cnt += len(y_true)
+        y = y_true.clone().detach().long()
+
+        y1 += (y == 1).sum()
+        y0 += (y == 0).sum()
+    return cnt, y1, y0
+        
 
 def train_gcn(device, train_data, val_data, test_data, table, save):
     if table:
         logger.setLevel(logging.ERROR)
 
-    graph_gcn = gcn(512,128,dropout=0.5, n_class=2)
+    graph_gcn = gcn(512,64,dropout=0.6, n_class=2)
     graph_gcn = graph_gcn.to(device)
-    optimizer = optim.Adam(graph_gcn.parameters(), lr=1*1e-3)
-    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(graph_gcn.parameters(), lr=4*1e-4)
+    #optimizer = optim.SGD(graph_gcn.parameters(),lr=2*1e-3,momentum=0.9)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=32, eta_min=0, last_epoch=-1)
+    train_size, train_true, train_false = train_data_process(train_data)
+    print(train_size, train_true, train_false)
+    eta = 0.1
+    weights = torch.tensor((train_false.item()/train_size+eta,train_true.item()/train_size-eta))
+    criterion = nn.CrossEntropyLoss(weight=weights)
     train_losses, val_losses, val_acc = [],[],0
     A_hat = np.matrix([[1, 0, 0, 0, 1, 1, 1, 0, 0, 0],
                        [0, 1, 0, 0, 1, 0, 0, 1, 1, 0],
@@ -56,12 +76,13 @@ def train_gcn(device, train_data, val_data, test_data, table, save):
                        [0, 1, 1, 0, 0, 0, 0, 1, 0, 0],
                        [0, 1, 0, 1, 0, 0, 0, 0, 1, 0],
                        [0, 0, 1, 1, 0, 0, 0, 0, 0, 1]])
-
+    #np.clip(A_hat, 0.9, 1, out=A_hat)
     def train():
         graph_gcn.train()
         cnt = 0
         running_loss = 0
         corr = 0
+        
         for step, batch in enumerate(train_data):
             X_inpt, y_true = batch[0], batch[1]
             cnt += len(y_true)
@@ -93,7 +114,7 @@ def train_gcn(device, train_data, val_data, test_data, table, save):
                 cnt += len(y)
                 res = graph_gcn(x, A_hat)
                 y = y.clone().detach().long()
-                test_loss += criterion(res, y)
+                test_loss += criterion(res, y)*cnt
                 pred = torch.argmax(res.data, 1)
                 correct += (pred == y).sum().item()
                 correct1 += ((pred ==1)& (y == 1)).sum().item()
@@ -104,18 +125,26 @@ def train_gcn(device, train_data, val_data, test_data, table, save):
                 p0 += (pred == 0).sum().item()
         return correct, test_loss, cnt, correct1, correct0, y1, y0, p1, p0
 
-    early_stopping = EarlyStopping(patience=7, verbose=False)
-    for epoch in range(50):
+    early_stopping = EarlyStopping(patience=20, verbose=False)
+    print('train_acc, train_loss, test_acc_val, test_loss_val, test_acc_noval,p1,r1,p0,r0')
+    #print('train_acc, train_loss, test_loss, test_acc')
+    for epoch in range(100):
         train_corr, train_loss, train_cnt =train()
-        acc, loss, cnt, *args = test(val=True)
+        #acc, loss, cnt, *args = test(val=True)
         test_corr, test_loss, test_cnt, c1, c0, y1, y0, p1, p0 = test()
-
-        early_stopping(loss, graph_gcn)
+        scheduler.step() 
+        #if epoch == 0:
+        #    print(train_cnt, cnt, test_cnt)
+        #early_stopping(loss, graph_gcn)
         #if early_stopping.trained:
-        print('{:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f}, {:.2f},{:.2f},{:.2f},{:.2f}'.
-               format(train_corr / train_cnt, train_loss, acc / cnt, loss.item(),
-               test_corr / test_cnt, c1 / p1, c1 / y1, c0 / p0, c0 / y0, test_loss.item()))
+        print('train_acc, train_loss, test_acc_val, test_loss_val, test_acc_noval')
+        #print('{:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.2f},{:.2f}, {:.2f},{:.2f},{:.2f}'.
+        #       format(train_corr / train_cnt, train_loss, acc / cnt, loss.item()/cnt,
+        #       test_corr / test_cnt, c1 / p1, c1 / y1, c0 / p0, c0 / y0))
+        #print('{:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.2f}'.format(train_corr/train_cnt, train_loss, acc/cnt,loss.item()/cnt,test_corr/test_cnt))
+        print('{:.2f},  {:.2f}, {:.2f}, {:.3f}'.format(train_corr/train_cnt, train_loss, test_loss/test_cnt,test_corr/test_cnt))
         if early_stopping.early_stop:
+            torch.save(graph_gcn.state_dict(), 'collapse_gcn.ckpt')
             print('Early stopping')
             break
 
@@ -174,7 +203,7 @@ def main(device):
                          reactions=[reacts[i] for i in args.reactions],
                          topologies=[tops[i] for i in args.topologies])
         train_gcn(device=device,
-                  train_data=train_data,
+                  train_data=big_train_data,
                   val_data=val_data,
                   test_data=test_data,
                   table=args.table,
